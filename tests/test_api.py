@@ -10,9 +10,18 @@ import os
 import threading
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
+
+
+def _parse_iso(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 @pytest.fixture()
@@ -518,6 +527,301 @@ def test_legacy_sqlite_db_gets_failure_count_default(tmp_path, monkeypatch):
     assert result["state"] == "pending" and result["failure_count"] == 1
 
 
+# ------------------------------------------------------------- 指数退避
+
+BACKOFF = {"initial_seconds": 0.3, "multiplier": 2, "max_seconds": 5}
+
+
+def test_backoff_delays_reclaim_with_growth_and_caps(client):
+    submit(client, [{"key": "a", "max_retries": 4, "retry_backoff": BACKOFF}])
+
+    # 首次失败：延迟 initial * 2^0 = 0.3s，到期前不可领取，到期后可领
+    t1 = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    start = _utcnow()
+    r = _complete(client, t1, "b1", success=False, error="e1")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["state"] == "pending"
+    assert abs((_parse_iso(body["next_eligible_at"]) - start).total_seconds() - 0.3) < 0.2
+    # 退避未到期：pending 任务不可被领取
+    assert client.post("/tasks/claim", json={}).json()["count"] == 0
+    time.sleep(0.35)
+    t2 = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    assert t2["attempt"] == 2
+
+    # 第二次失败：延迟 0.3 * 2^1 = 0.6s
+    r = _complete(client, t2, "b2", success=False, error="e2")
+    assert abs((_parse_iso(r.json()["next_eligible_at"]) - start).total_seconds() - (0.3 + 0.6)) < 0.3
+    assert client.post("/tasks/claim", json={}).json()["count"] == 0
+    time.sleep(0.65)
+    t3 = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    assert t3["attempt"] == 3
+
+    # 第三次失败：0.3 * 2^2 = 1.2s，但 cap 到 max_seconds=5 前未到上限；
+    # 第四次失败：0.3 * 2^3 = 2.4s，仍未达上限
+    r = _complete(client, t3, "b3", success=False, error="e3")
+    assert abs((_parse_iso(r.json()["next_eligible_at"]) - start).total_seconds()
+               - (0.3 + 0.6 + 1.2)) < 0.4
+    time.sleep(1.25)
+    t4 = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    r = _complete(client, t4, "b4", success=False, error="e4")
+    assert r.json()["state"] == "pending"
+    # 第五次显式失败将超出 max_retries=4：本次（第 4 次失败）延迟 2.4s 未被 cap
+    assert abs((_parse_iso(r.json()["next_eligible_at"]) - start).total_seconds()
+               - (0.3 + 0.6 + 1.2 + 2.4)) < 0.5
+    # 领取会清掉 next_eligible_at
+    time.sleep(2.45)
+    t5 = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    status = client.get(f"/tasks/{t5['task_id']}").json()
+    assert status["state"] == "running" and status["next_eligible_at"] is None
+    # 第 5 次显式失败：额度耗尽 -> failed，无 next_eligible_at
+    r = _complete(client, t5, "b5", success=False, error="fatal")
+    assert r.json()["state"] == "failed" and r.json()["next_eligible_at"] is None
+
+
+def test_backoff_delay_capped_at_max_seconds(client):
+    submit(
+        client,
+        [{"key": "a", "max_retries": 3,
+          "retry_backoff": {"initial_seconds": 0.3, "multiplier": 10, "max_seconds": 1}}],
+    )
+    t1 = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    start = _utcnow()
+    r = _complete(client, t1, "c1", success=False)
+    assert r.status_code == 200
+    # 0.3 * 10^0 = 0.3
+    assert abs((_parse_iso(r.json()["next_eligible_at"]) - start).total_seconds() - 0.3) < 0.2
+    time.sleep(0.35)
+    t2 = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    # 第二次：0.3 * 10^1 = 3 -> cap 为 max_seconds=1
+    r = _complete(client, t2, "c2", success=False)
+    elapsed = (_parse_iso(r.json()["next_eligible_at"]) - start).total_seconds()
+    assert abs(elapsed - (0.3 + 1.0)) < 0.3
+    time.sleep(1.05)
+    t3 = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    r = _complete(client, t3, "c3", success=False)
+    # 第三次同样被 cap 为 1
+    assert client.post("/tasks/claim", json={}).json()["count"] == 0
+    time.sleep(1.05)
+    assert client.post("/tasks/claim", json={}).json()["claimed"][0]["attempt"] == 4
+
+
+def test_backoff_multiplier_one_constant_delay(client):
+    submit(
+        client,
+        [{"key": "a", "max_retries": 2,
+          "retry_backoff": {"initial_seconds": 0.3, "multiplier": 1, "max_seconds": 0.3}}],
+    )
+    t = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    for cid in ("m1", "m2"):
+        start = _utcnow()
+        r = _complete(client, t, cid, success=False)
+        assert r.status_code == 200 and r.json()["state"] == "pending"
+        assert abs((_parse_iso(r.json()["next_eligible_at"]) - start).total_seconds() - 0.3) < 0.2
+        assert client.post("/tasks/claim", json={}).json()["count"] == 0
+        time.sleep(0.35)
+        t = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    assert t["attempt"] == 3
+
+
+def test_lease_expiry_reclaim_ignores_backoff(client):
+    submit(
+        client,
+        [{"key": "a", "max_retries": 2, "lease_seconds": 0.2, "retry_backoff": BACKOFF}],
+    )
+    t1 = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    time.sleep(0.25)
+    # 租约过期重领不触发退避：无需等待 initial_seconds
+    t2 = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    assert t2["attempt"] == 2 and t2["lease_token"] != t1["lease_token"]
+    # 显式失败后才进入退避
+    r = _complete(client, t2, "e1", success=False)
+    assert r.json()["state"] == "pending"
+    assert r.json()["next_eligible_at"] is not None
+    assert client.post("/tasks/claim", json={}).json()["count"] == 0
+    time.sleep(0.35)
+    t3 = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    assert t3["attempt"] == 3
+    # 领取后 next_eligible_at 已清空；租约过期可立即重领（无退避）
+    time.sleep(0.25)
+    t4 = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    assert t4["attempt"] == 4
+
+
+def test_no_backoff_keeps_immediate_retry(client):
+    submit(client, [{"key": "a", "max_retries": 1}])
+    t = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    r = _complete(client, t, "i1", success=False)
+    assert r.json()["state"] == "pending" and r.json()["next_eligible_at"] is None
+    t2 = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    assert t2["attempt"] == 2
+    status = client.get(f"/tasks/{t2['task_id']}").json()
+    assert status["retry_backoff"] is None and status["next_eligible_at"] is None
+
+
+def test_backoff_rejected_when_validation_fails(client):
+    bad_bodies = [
+        {"initial_seconds": 0, "multiplier": 1, "max_seconds": 1},          # initial 必须 > 0
+        {"initial_seconds": -1, "multiplier": 1, "max_seconds": 1},
+        {"initial_seconds": 1, "multiplier": 0.5, "max_seconds": 1},        # multiplier >= 1
+        {"initial_seconds": 5, "multiplier": 1, "max_seconds": 1},          # max < initial
+        {"initial_seconds": 1, "multiplier": 2},                             # 缺 max_seconds
+        {"multiplier": 2, "max_seconds": 1},                                 # 缺 initial
+    ]
+    for backoff in bad_bodies:
+        r = client.post("/dags", json={"tasks": [{"key": "a", "retry_backoff": backoff}]})
+        assert r.status_code == 422, backoff
+    # 合法策略正常提交
+    dag = submit(client, [{"key": "a", "retry_backoff":
+                          {"initial_seconds": 1, "multiplier": 1.5, "max_seconds": 10}}])
+    assert by_key(dag, "a")["retry_backoff"] == {
+        "initial_seconds": 1.0, "multiplier": 1.5, "max_seconds": 10.0,
+    }
+
+
+def test_backoff_visible_in_task_views_and_cleared_on_success(client):
+    dag = submit(client, [{"key": "a", "max_retries": 2, "retry_backoff": BACKOFF}])
+    expected = {"initial_seconds": 0.3, "multiplier": 2.0, "max_seconds": 5.0}
+    assert by_key(dag, "a")["retry_backoff"] == expected
+    assert by_key(dag, "a")["next_eligible_at"] is None
+
+    listed = client.get("/tasks", params={"dag_id": dag["id"]}).json()["tasks"]
+    assert listed[0]["retry_backoff"] == expected
+
+    t = client.post("/tasks/claim", json={"dag_id": dag["id"]}).json()["claimed"][0]
+    detail = client.get(f"/tasks/{t['task_id']}").json()
+    assert detail["retry_backoff"] == expected and detail["next_eligible_at"] is None
+
+    r = _complete(client, t, "f1", success=False)
+    eligible = r.json()["next_eligible_at"]
+    detail = client.get(f"/tasks/{t['task_id']}").json()
+    assert detail["state"] == "pending" and detail["next_eligible_at"] == eligible
+
+    # 到期领取后成功：退避时刻清空，策略保留
+    time.sleep(0.35)
+    t2 = client.post("/tasks/claim", json={"dag_id": dag["id"]}).json()["claimed"][0]
+    assert _complete(client, t2, "ok", success=True).status_code == 200
+    detail = client.get(f"/tasks/{t2['task_id']}").json()
+    assert detail["state"] == "succeeded"
+    assert detail["next_eligible_at"] is None
+    assert detail["retry_backoff"] == expected
+
+
+def test_backoff_requeued_event_carries_next_eligible_at(client):
+    dag = submit(client, [{"key": "a", "max_retries": 1, "retry_backoff": BACKOFF}])
+    t = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    r = _complete(client, t, "f1", success=False)
+    eligible = r.json()["next_eligible_at"]
+    assert eligible is not None
+
+    events = client.get("/events", params={"dag_id": dag["id"]}).json()["events"]
+    requeued = events[-1]
+    assert requeued["type"] == "task.requeued"
+    assert requeued["next_eligible_at"] == eligible
+
+    # 其他事件类型不携带该字段（为 null）
+    claimed = next(e for e in events if e["type"] == "task.claimed")
+    assert claimed["next_eligible_at"] is None
+
+
+def test_backoff_persists_across_restart(tmp_path, monkeypatch):
+    """退避策略与 next_eligible_at 持久化在 SQLite：重启后仍生效。"""
+    db_file = tmp_path / "backoff.db"
+    monkeypatch.setenv("DB_PATH", str(db_file))
+    monkeypatch.setenv("DEFAULT_LEASE_SECONDS", "30")
+
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    with TestClient(app) as c1:
+        submit(c1, [{"key": "a", "max_retries": 2, "retry_backoff": BACKOFF}], dag_id="bo")
+        t = c1.post("/tasks/claim", json={}).json()["claimed"][0]
+        r = c1.post(
+            f"/tasks/{t['task_id']}/complete",
+            json={"completion_id": "f1", "lease_token": t["lease_token"],
+                  "success": False, "error": "e"},
+        )
+        assert r.status_code == 200 and r.json()["next_eligible_at"] is not None
+        task_id = t["task_id"]
+
+    # 重启后：退避未到期不可领取，策略仍可读
+    with TestClient(app) as c2:
+        assert c2.post("/tasks/claim", json={}).json()["count"] == 0
+        detail = c2.get(f"/tasks/{task_id}").json()
+        assert detail["retry_backoff"] == {
+            "initial_seconds": 0.3, "multiplier": 2.0, "max_seconds": 5.0,
+        }
+        assert detail["state"] == "pending" and detail["next_eligible_at"] is not None
+        assert detail["failure_count"] == 1
+
+
+def test_legacy_sqlite_db_gets_null_backoff(tmp_path, monkeypatch):
+    """旧版 tasks/events 表迁移后补齐退避列（NULL）：立即重试、事件字段为 null。"""
+    import sqlite3
+
+    db_file = tmp_path / "legacy-backoff.db"
+    conn = sqlite3.connect(db_file)
+    conn.executescript(
+        """
+        CREATE TABLE dags (id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL);
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY, dag_id TEXT NOT NULL, task_key TEXT NOT NULL, name TEXT NOT NULL,
+            payload TEXT, max_retries INTEGER NOT NULL DEFAULT 0, lease_seconds REAL NOT NULL,
+            state TEXT NOT NULL, blocked_reason TEXT, lease_token TEXT, lease_expires_at TEXT,
+            worker_id TEXT, attempt INTEGER NOT NULL DEFAULT 0, failure_count INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT,
+            UNIQUE(dag_id, task_key));
+        CREATE TABLE dependencies (dag_id TEXT, task_key TEXT, dep_key TEXT,
+            PRIMARY KEY (dag_id, task_key, dep_key));
+        CREATE TABLE attempts (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, attempt_no INTEGER,
+            lease_token TEXT UNIQUE, worker_id TEXT, leased_at TEXT, expires_at TEXT,
+            heartbeat_at TEXT, state TEXT, error TEXT);
+        CREATE TABLE completions (
+            task_id TEXT NOT NULL, completion_id TEXT NOT NULL, lease_token TEXT NOT NULL,
+            success INTEGER NOT NULL, fingerprint TEXT NOT NULL, status_code INTEGER NOT NULL,
+            response_body TEXT NOT NULL, created_at TEXT NOT NULL,
+            PRIMARY KEY (task_id, completion_id));
+        CREATE TABLE events (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT, event_type TEXT NOT NULL,
+            dag_id TEXT NOT NULL, task_id TEXT, attempt INTEGER, from_state TEXT,
+            to_state TEXT, occurred_at TEXT NOT NULL);
+        CREATE TABLE concurrency_groups (name TEXT PRIMARY KEY, limit_value INTEGER NOT NULL,
+            created_at TEXT NOT NULL);
+        INSERT INTO dags VALUES ('d1', 'old', '2026-01-01T00:00:00Z');
+        INSERT INTO tasks (id, dag_id, task_key, name, max_retries, lease_seconds, state,
+                           attempt, created_at)
+        VALUES ('t1', 'd1', 'a', 'a', 2, 30, 'pending', 0, '2026-01-01T00:00:00Z');
+        INSERT INTO events (event_type, dag_id, occurred_at)
+        VALUES ('dag.created', 'd1', '2026-01-01T00:00:00Z');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setenv("DB_PATH", str(db_file))
+    from app.db import init_db
+    from app import service
+
+    init_db()
+    init_db()  # 迁移幂等
+
+    # 旧任务无退避策略、立即可领
+    t = service.claim_tasks(None, None, 1)["claimed"][0]
+    assert t["attempt"] == 1
+    result = service.complete_task(
+        t["task_id"],
+        {"completion_id": "cmp-legacy-bo", "lease_token": t["lease_token"], "success": False},
+    )
+    assert result["state"] == "pending"
+    assert result["next_eligible_at"] is None  # 未配置退避：立即重试
+
+    detail = service.get_task(t["task_id"])
+    assert detail["retry_backoff"] is None and detail["next_eligible_at"] is None
+    # 旧事件迁移后字段可读且为 null；新 requeued 事件同样为 null
+    events = service.list_events(0, 50, None)["events"]
+    assert all(e["next_eligible_at"] is None for e in events)
+
+
 # ------------------------------------------------------------- 状态接口
 
 def test_status_lists_attempts_and_lease(client):
@@ -629,6 +933,8 @@ def test_task_lifecycle_event_sequence(client):
     assert requeued["attempt"] == 1
     assert requeued["from_state"] == "running"
     assert requeued["to_state"] == "pending"
+    # 未配置退避：事件携带 null
+    assert requeued["next_eligible_at"] is None
 
     # 重新领取 -> claimed（pending -> running，attempt=2）
     t2 = client.post("/tasks/claim", json={}).json()["claimed"][0]

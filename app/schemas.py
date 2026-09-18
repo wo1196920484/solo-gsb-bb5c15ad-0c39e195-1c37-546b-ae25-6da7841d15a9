@@ -7,6 +7,20 @@ from typing import Any
 from pydantic import BaseModel, Field, model_validator
 
 
+class RetryBackoffIn(BaseModel):
+    """持久化指数退避策略：仅作用于显式失败后的重试，不作用于租约过期重领。"""
+
+    initial_seconds: float = Field(..., gt=0, allow_inf_nan=False, description="首次失败后的重试延迟（秒），必须为正")
+    multiplier: float = Field(..., ge=1, allow_inf_nan=False, description="退避倍数，>=1")
+    max_seconds: float = Field(..., gt=0, allow_inf_nan=False, description="重试延迟上限（秒），不得小于 initial_seconds")
+
+    @model_validator(mode="after")
+    def _max_not_smaller_than_initial(self) -> "RetryBackoffIn":
+        if self.max_seconds < self.initial_seconds:
+            raise ValueError("max_seconds 必须不小于 initial_seconds")
+        return self
+
+
 class TaskIn(BaseModel):
     key: str = Field(..., min_length=1, description="DAG 内唯一任务键")
     name: str = ""
@@ -16,6 +30,10 @@ class TaskIn(BaseModel):
     lease_seconds: float | None = Field(None, gt=0, description="租约时长，缺省取服务端默认值")
     duration_seconds: float | None = Field(
         None, gt=0, allow_inf_nan=False, description="预计执行时长（秒），缺省为 1；用于只读分析"
+    )
+    retry_backoff: RetryBackoffIn | None = Field(
+        None,
+        description="可选指数退避策略；缺省（null）表示显式失败后立即重试，不延迟",
     )
     concurrency_group: str | None = Field(
         None,

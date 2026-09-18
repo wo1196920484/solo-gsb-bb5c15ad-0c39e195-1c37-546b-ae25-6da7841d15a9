@@ -27,6 +27,20 @@ DAG，工作器原子领取「所有前置均已成功」的任务，凭借唯�
   被重新领取只增加 `attempt`，不影响失败计数。失败后回到 `pending` 等待下一次领取；
   `failure_count` 达到上限后置为 `failed`，并递归阻塞所有直接/间接后继
   （状态 `blocked`，带 `blocked_reason`），后继永远无法被领取。
+- **持久化指数退避**：任务可在提交时配置 `retry_backoff`：
+  `{"initial_seconds": >0, "multiplier": >=1, "max_seconds": >= initial_seconds}`，
+  随任务持久化（`max_seconds < initial_seconds` 等非法组合在提交时 422 拒绝）。
+  **显式失败且仍有重试额度**时，在回报的同一事务内按
+  `delay = min(max_seconds, initial_seconds * multiplier^(failure_count-1))`
+  （首次失败 `failure_count=1`，幂次从 0 起）计算延迟，把
+  `next_eligible_at = 回报时刻 + delay` 与状态回队一起落库并在回报响应中返回；
+  领取只选取该时刻**已到**（`<= now`）的 `pending` 任务，未到期一律跳过。
+  **租约过期重领不触发退避**：退避只作用于显式失败，过期任务立即可被重领，且领取时
+  清空 `next_eligible_at`。未配置 `retry_backoff` 的任务（含历史数据）保持**立即重试**
+  （`next_eligible_at` 为 `null`）。任务查询（`GET /tasks/{id}`、`GET /tasks`、
+  `GET /dags/{id}`）返回持久化的 `retry_backoff` 策略与当前 `next_eligible_at`；
+  `task.requeued` 事件携带 `next_eligible_at`（其他事件该字段为 `null`）。
+  策略与下次可领时刻均持久化在 SQLite 中，服务重启后仍然有效。
 - **幂等回报**：回报接口必须携带客户端生成的 `completion_id`。相同
   `task_id + completion_id` 且 `lease_token`、`success`、`result`、`error`
   等价的请求只生效一次——即使任务此后已被重新领取，重放也逐字节返回首次响应
@@ -87,10 +101,24 @@ curl -s -X POST http://localhost:8000/dags \
     "name": "etl",
     "tasks": [
       {"key": "extract",   "lease_seconds": 60, "duration_seconds": 3},
-      {"key": "transform", "deps": ["extract"], "max_retries": 2, "lease_seconds": 60, "duration_seconds": 5},
+      {"key": "transform", "deps": ["extract"], "max_retries": 2, "lease_seconds": 60, "duration_seconds": 5,
+       "retry_backoff": {"initial_seconds": 2, "multiplier": 3, "max_seconds": 60}},
       {"key": "load",      "deps": ["transform"]}
     ]
   }'
+```
+
+`transform` 显式失败后按指数退避重试：第 1 次失败等 2s、第 2 次等 6s
+（`min(60, 2·3^(failure_count-1))`，受 `max_seconds=60` 封顶），
+到期前不会被任何领取请求选中；不配置 `retry_backoff` 的任务失败后立即可重领。
+非法策略（`initial_seconds<=0`、`multiplier<1`、`max_seconds<initial_seconds`）
+在提交时返回 422：
+
+```bash
+# max_seconds 小于 initial_seconds
+curl -i -X POST http://localhost:8000/dags -H 'Content-Type: application/json' \
+  -d '{"tasks":[{"key":"a","retry_backoff":{"initial_seconds":10,"multiplier":2,"max_seconds":5}}]}'
+# -> 422
 ```
 
 非法图会被拒绝（422）：
@@ -233,6 +261,30 @@ curl -s -X POST http://localhost:8000/tasks/<TASK_ID>/complete \
   -d '{"completion_id": "9b22…", "lease_token": "…", "success": false, "error": "connection reset"}'
 ```
 
+显式失败但仍有重试额度时，响应携带失败计数、剩余额度与下次可领时刻；任务配置了
+`retry_backoff` 时 `next_eligible_at` 为退避到期时刻（此前领取不会选中它），
+未配置时为 `null`（立即重试）：
+
+```json
+{
+  "task_id": "…", "state": "pending", "attempt": 1,
+  "failure_count": 1, "retries_remaining": 2, "blocked_descendants": 0,
+  "next_eligible_at": "2026-09-18T11:00:02Z"
+}
+```
+
+任务查询返回持久化的退避策略与当前可领时刻：
+
+```bash
+curl -s http://localhost:8000/tasks/<TASK_ID> | jq '{state, retry_backoff, next_eligible_at}'
+# {"state": "pending",
+#  "retry_backoff": {"initial_seconds": 2.0, "multiplier": 3.0, "max_seconds": 60.0},
+#  "next_eligible_at": "2026-09-18T11:00:02Z"}
+```
+
+> 退避只作用于**显式失败**：租约过期后的重新领取立即生效，不等待 `next_eligible_at`；
+> 任务被领取后该字段清空。最终失败或成功时 `next_eligible_at` 同样为 `null`。
+
 幂等语义：
 
 - 同一 `task_id + completion_id` 且 `lease_token`/`success`/`result`/`error`
@@ -282,6 +334,11 @@ curl -s 'http://localhost:8000/tasks?state=blocked'
 并发组任务示例：`{"key": "write-a1", "state": "running",
 "concurrency": {"group": "db-writers", "limit": 2}, "lease": {"expired": false, …}}`。
 
+退避等待中的任务示例：`{"key": "transform", "state": "pending",
+"retry_backoff": {"initial_seconds": 2.0, "multiplier": 3.0, "max_seconds": 60.0},
+"next_eligible_at": "2026-09-18T11:00:02Z", "lease": null}`；
+未配置退避时 `retry_backoff` 与 `next_eligible_at` 均为 `null`。
+
 ### 6. 事件流
 
 事件流只增不改，记录全部关键状态变迁。每条事件形如：
@@ -295,6 +352,7 @@ curl -s 'http://localhost:8000/tasks?state=blocked'
   "attempt": 1,
   "from_state": "pending",
   "to_state": "running",
+  "next_eligible_at": null,
   "occurred_at": "2026-09-17T11:00:00Z"
 }
 ```
@@ -303,6 +361,8 @@ curl -s 'http://localhost:8000/tasks?state=blocked'
   `task.succeeded` / `task.failed` / `task.blocked`；
 - `sequence` 为全局严格递增游标，事件按其升序返回；`dag.created` 事件的
   `task_id`、`attempt`、`from_state`、`to_state` 均为 `null`；
+- `next_eligible_at` 仅 `task.requeued` 携带：配置了 `retry_backoff` 时为退避后的
+  下次可领时刻，未配置时为 `null`；其他事件类型该字段始终为 `null`；
 - 事件与对应业务变更在同一事务提交，回滚不留事件；存储层禁止
   `UPDATE`/`DELETE`，保证不可变。
 
@@ -318,9 +378,11 @@ curl -s 'http://localhost:8000/events?after=0&limit=50'
   "events": [
     {"sequence": 1, "type": "dag.created", "dag_id": "d1", "task_id": null,
      "attempt": null, "from_state": null, "to_state": null,
+     "next_eligible_at": null,
      "occurred_at": "2026-09-17T10:59:59Z"},
     {"sequence": 2, "type": "task.claimed", "dag_id": "d1", "task_id": "…",
      "attempt": 1, "from_state": "pending", "to_state": "running",
+     "next_eligible_at": null,
      "occurred_at": "2026-09-17T11:00:00Z"}
   ],
   "next_after": 2
@@ -380,7 +442,7 @@ curl -s http://localhost:8000/dags/<DAG_ID>/analysis | jq
 | --- | --- | --- |
 | DAG 创建 | `dag.created` | 可空字段均为 `null` |
 | 首次领取 / 过期重领 | `task.claimed` | `pending`（或 `running`）→ `running` |
-| 显式失败、仍有重试额度 | `task.requeued` | `running` → `pending` |
+| 显式失败、仍有重试额度 | `task.requeued` | `running` → `pending`；携带 `next_eligible_at`（无退避为 `null`） |
 | 回报成功 | `task.succeeded` | `running` → `succeeded` |
 | 显式失败、重试耗尽 | `task.failed` | `running` → `failed` |
 | 递归阻塞后继 | `task.blocked` | 原状态（`pending`/`running`）→ `blocked` |
@@ -405,9 +467,11 @@ curl -s http://localhost:8000/dags/<DAG_ID>/analysis | jq
 ```
 pending ──claim──▶ running ──complete(success)──────────▶ succeeded
   ▲                  │  │
-  │ fail (可重试)    │  └─complete(fail, 重试耗尽)─▶ failed ──▶ blocked(所有后继)
+  │ fail (可重试;    │  └─complete(fail, 重试耗尽)─▶ failed ──▶ blocked(所有后继)
+  │ retry_backoff    │
+  │ 到期才可重领)    │
   └──────────────────┘
-                     └─租约过期─▶ 可被再次 claim（attempt+1，新令牌；旧令牌全部 409）
+                     └─租约过期─▶ 可被再次 claim（attempt+1，新令牌；旧令牌全部 409；不触发退避）
 ```
 
 ## 开发与测试
@@ -422,6 +486,9 @@ pytest -q
 limit、跨 DAG 共享容量、同名组上限持久化一致与冲突整批回滚、成功/失败/过期释放名额、
 心跳续租保持占用、重启后上限与限流仍生效、无组任务不受影响、旧库迁移补 NULL）、
 attempt 递增与令牌唯一、过期后旧令牌 409、心跳续租、重试与耗尽后递归阻塞、
+指数退避（参数校验、延迟按 `initial*multiplier^(n-1)` 增长与 `max_seconds` 封顶、
+未到期不可领取、领取清空 `next_eligible_at`、租约过期重领不触发退避、无退避立即重试、
+策略与下次可领时刻在任务视图/回报/事件中返回、重启持久化、旧库迁移补 NULL）、
 幂等回报（重放同响应、内容冲突 409、键序等价、重启后持久化）、旧 SQLite 数据迁移、
 状态接口、持久化事件流（各事件类型与状态对、同事务回滚不留事件、重放不产生事件、
 键集分页无漏项/重复、dag_id 过滤、参数校验、重启后不重置、存储层不可变）、

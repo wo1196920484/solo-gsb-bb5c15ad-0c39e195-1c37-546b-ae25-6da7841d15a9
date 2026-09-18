@@ -85,6 +85,15 @@ def init_db(path: Path | None = None) -> None:
                 -- 独立的显式失败计数：只有 complete(success=false) 才递增；
                 -- 租约过期后的重新领取只增加 attempt，不消耗重试预算。
                 failure_count       INTEGER NOT NULL DEFAULT 0,
+                -- 持久化指数退避策略（提交时固化，三列同为 NULL 或同为非空）。
+                -- 仅显式失败且仍有重试额度时生效：延迟
+                -- min(max_seconds, initial_seconds * multiplier^(failure_count-1))。
+                backoff_initial_seconds REAL,
+                backoff_multiplier      REAL,
+                backoff_max_seconds     REAL,
+                -- 退避后重新进入候选集的时刻：pending 任务须等待
+                -- next_eligible_at <= 当前时刻才可被领取；NULL 表示立即可领。
+                next_eligible_at    TEXT,
                 created_at          TEXT NOT NULL,
                 started_at          TEXT,
                 finished_at         TEXT,
@@ -140,6 +149,8 @@ def init_db(path: Path | None = None) -> None:
                 attempt       INTEGER,         -- 任务当前尝试序号；dag.created 时为 NULL
                 from_state    TEXT,            -- 变更前状态；dag.created 时为 NULL
                 to_state      TEXT,            -- 变更后状态；dag.created 时为 NULL
+                -- 退避后的下次可领时刻：仅 task.requeued 携带；其他事件为 NULL
+                next_eligible_at TEXT,
                 occurred_at   TEXT NOT NULL
             );
 
@@ -181,11 +192,26 @@ def init_db(path: Path | None = None) -> None:
             conn.execute(
                 "ALTER TABLE tasks ADD COLUMN concurrency_group TEXT REFERENCES concurrency_groups(name)"
             )
+        # 旧库迁移：为已有任务补齐指数退避策略列与下次可领时刻。
+        # ADD COLUMN 默认 NULL：历史任务未配置退避（保持立即重试），
+        # next_eligible_at 为 NULL（可立即被领取），与新库的无退避任务完全一致。
+        if "backoff_initial_seconds" not in columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN backoff_initial_seconds REAL")
+        if "backoff_multiplier" not in columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN backoff_multiplier REAL")
+        if "backoff_max_seconds" not in columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN backoff_max_seconds REAL")
+        if "next_eligible_at" not in columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN next_eligible_at TEXT")
         conn.execute(
             """CREATE INDEX IF NOT EXISTS idx_tasks_group_occupancy
                    ON tasks(concurrency_group)
                    WHERE state = 'running' AND lease_token IS NOT NULL"""
         )
+        # 旧库迁移：事件流补齐退避可领时刻列。历史事件均不携带该字段，默认 NULL。
+        event_columns = {r[1] for r in conn.execute("PRAGMA table_info(events)").fetchall()}
+        if "next_eligible_at" not in event_columns:
+            conn.execute("ALTER TABLE events ADD COLUMN next_eligible_at TEXT")
 
 
 @contextmanager
