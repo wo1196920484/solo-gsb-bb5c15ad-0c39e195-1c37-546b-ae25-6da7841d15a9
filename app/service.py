@@ -42,17 +42,19 @@ def _append_event(
     attempt: int | None = None,
     from_state: str | None = None,
     to_state: str | None = None,
+    next_eligible_at: str | None = None,
 ) -> None:
     """在调用方的当前事务内追加一条不可变事件。
 
     不自行提交：事件必须与其记录的业务变更同生共死，事务回滚则不留事件。
-    dag.created 不携带任务信息，可空字段一律为 NULL。
+    dag.created 不携带任务信息，可空字段一律为 NULL。next_eligible_at 仅
+    task.requeued 且配置了退避策略时非空。
     """
     conn.execute(
         """INSERT INTO events (event_type, dag_id, task_id, attempt,
-               from_state, to_state, occurred_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (event_type, dag_id, task_id, attempt, from_state, to_state, occurred_at),
+               from_state, to_state, next_eligible_at, occurred_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (event_type, dag_id, task_id, attempt, from_state, to_state, next_eligible_at, occurred_at),
     )
 
 
@@ -236,11 +238,13 @@ def submit_dag(body: dict[str, Any]) -> dict[str, Any]:
                 t = tasks_by_key[key]
                 lease = float(t.get("lease_seconds") or default_lease)
                 duration = float(t.get("duration_seconds") or default_duration)
+                backoff = t.get("retry_backoff")
                 conn.execute(
                     """INSERT INTO tasks (id, dag_id, task_key, name, payload,
                            max_retries, lease_seconds, duration_seconds, state, attempt,
-                           created_at, concurrency_group)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)""",
+                           created_at, concurrency_group,
+                           backoff_initial_seconds, backoff_multiplier, backoff_max_seconds)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)""",
                     (
                         uuid.uuid4().hex,
                         dag_id,
@@ -253,6 +257,9 @@ def submit_dag(body: dict[str, Any]) -> dict[str, Any]:
                         PENDING,
                         now,
                         t.get("concurrency_group"),
+                        float(backoff["initial_seconds"]) if backoff else None,
+                        float(backoff["multiplier"]) if backoff else None,
+                        float(backoff["max_seconds"]) if backoff else None,
                     ),
                 )
                 for dep in deps_map[key]:
@@ -278,11 +285,12 @@ _CLAIMABLE_PAGE_SQL = """
     FROM tasks t
     WHERE (:dag_id IS NULL OR t.dag_id = :dag_id)
       AND (
-            -- 从未被领取
-            (t.state = 'pending' AND t.attempt = 0)
-            -- 重试后重新排队
-            OR (t.state = 'pending' AND t.attempt > 0)
-            -- 租约已过期，可被（重新）领取，产生新的尝试
+            -- pending（从未领取或重试回队）：退避时刻未到（next_eligible_at > now）
+            -- 的任务不可被领取；未配置退避或时刻已到则立即可领
+            (t.state = 'pending'
+                AND (t.next_eligible_at IS NULL OR t.next_eligible_at <= :now))
+            -- 租约已过期，可被（重新）领取，产生新的尝试：
+            -- 过期重领不触发退避，不检查 next_eligible_at
             OR (t.state = 'running' AND t.lease_expires_at IS NOT NULL
                 AND t.lease_expires_at < :now)
           )
@@ -372,7 +380,8 @@ def claim_tasks(worker_id: str | None, dag_id: str | None, limit: int) -> dict[s
                     cur = conn.execute(
                         """UPDATE tasks
                            SET state = 'running', attempt = ?, lease_token = ?,
-                               lease_expires_at = ?, worker_id = ?, started_at = COALESCE(started_at, ?)
+                               lease_expires_at = ?, worker_id = ?, started_at = COALESCE(started_at, ?),
+                               next_eligible_at = NULL
                            WHERE id = ?""",
                         (attempt_no, token, _iso(expires), worker_id, now_iso, row["id"]),
                     )
@@ -486,6 +495,28 @@ def heartbeat(task_id: str, body: dict[str, Any]) -> dict[str, Any]:
 
 # ---------------------------------------------------------------- 结果回报
 
+def _backoff_delay_seconds(row, failure_count: int) -> float | None:
+    """按持久化策略计算第 failure_count 次显式失败后的退避延迟（秒）。
+
+    延迟 = min(max_seconds, initial_seconds * multiplier ** (failure_count - 1))。
+    任务未配置 retry_backoff（策略三列为 NULL，含旧库迁移的历史任务）时返回 None，
+    调用方据此保持立即重试。未封顶值超过浮点上限时直接视为已封顶（结果恒为
+    max_seconds），避免极大 multiplier/失败次数导致 OverflowError。
+    """
+    initial = row["backoff_initial_seconds"]
+    if initial is None:
+        return None
+    multiplier = row["backoff_multiplier"]
+    cap = row["backoff_max_seconds"]
+    try:
+        delay = initial * (multiplier ** (failure_count - 1))
+    except OverflowError:
+        return cap
+    if not math.isfinite(delay):
+        return cap
+    return min(cap, delay)
+
+
 def _block_descendants(conn, dag_id: str, root_key: str, occurred_at: str) -> int:
     """永久失败后，递归阻塞全部直接/间接后继。返回阻塞任务数。"""
     rows = conn.execute(
@@ -517,7 +548,8 @@ def _block_descendants(conn, dag_id: str, root_key: str, occurred_at: str) -> in
         conn.execute(
             """UPDATE tasks
                SET state = 'blocked', blocked_reason = ?,
-                   lease_token = NULL, lease_expires_at = NULL, worker_id = NULL
+                   lease_token = NULL, lease_expires_at = NULL, worker_id = NULL,
+                   next_eligible_at = NULL
                WHERE id = ?""",
             (reason, target["id"]),
         )
@@ -582,6 +614,9 @@ def complete_task(task_id: str, body: dict[str, Any]) -> dict[str, Any] | Replay
             _assert_active(row)
             task_id = row["id"]
             blocked_count = 0
+            # 回队时的下次可领时刻：仅显式失败、仍有额度且配置了退避策略时非空；
+            # 成功/最终失败/未配置退避均为 None（立即可领或已结束）。
+            next_eligible_at_iso: str | None = None
 
             if success:
                 conn.execute(
@@ -618,18 +653,26 @@ def complete_task(task_id: str, body: dict[str, Any]) -> dict[str, Any] | Replay
                 failure_count = row["failure_count"] + 1
                 will_retry = failure_count <= row["max_retries"]
                 if will_retry:
-                    # 回到待领取队列；下一次领取产生 attempt+1 的新尝试与新令牌
+                    # 退避延迟在同一回报事务内按持久化策略计算；未配置策略时
+                    # delay 为 None，next_eligible_at 保持 NULL（立即重试）。
+                    delay = _backoff_delay_seconds(row, failure_count)
+                    if delay is not None:
+                        next_eligible_at_iso = _iso(now + timedelta(seconds=delay))
+                    # 回到待领取队列；下一次领取产生 attempt+1 的新尝试与新令牌。
+                    # 退避未到期的 pending 任务在领取 SQL 中被门控，时刻已到才可领。
                     conn.execute(
                         """UPDATE tasks SET state = 'pending', lease_token = NULL,
-                               lease_expires_at = NULL, worker_id = NULL
+                               lease_expires_at = NULL, worker_id = NULL,
+                               next_eligible_at = ?
                            WHERE id = ?""",
-                        (task_id,),
+                        (next_eligible_at_iso, task_id),
                     )
                     conn.execute(
                         "UPDATE attempts SET state = 'failed', error = ? WHERE lease_token = ?",
                         (error, token),
                     )
-                    # task.requeued 与状态回队同事务（失败但仍有重试额度）
+                    # task.requeued 与状态回队同事务（失败但仍有重试额度），
+                    # 携带按策略算出的下次可领时刻（未配置退避时为 null）
                     _append_event(
                         conn,
                         EVT_TASK_REQUEUED,
@@ -639,12 +682,14 @@ def complete_task(task_id: str, body: dict[str, Any]) -> dict[str, Any] | Replay
                         attempt=row["attempt"],
                         from_state=RUNNING,
                         to_state=PENDING,
+                        next_eligible_at=next_eligible_at_iso,
                     )
                     state = PENDING
                 else:
                     conn.execute(
                         """UPDATE tasks SET state = 'failed', lease_token = NULL,
-                               lease_expires_at = NULL, finished_at = ?
+                               lease_expires_at = NULL, finished_at = ?,
+                               next_eligible_at = NULL
                            WHERE id = ?""",
                         (_iso(now), task_id),
                     )
@@ -683,6 +728,8 @@ def complete_task(task_id: str, body: dict[str, Any]) -> dict[str, Any] | Replay
                 "failure_count": saved_failure_count,
                 "retries_remaining": retries_remaining,
                 "blocked_descendants": blocked_count,
+                # 失败回队且配置退避时为按策略算出的可领时刻；其余情形为 null
+                "next_eligible_at": next_eligible_at_iso,
             }
             # 与状态变更同一事务持久化：保存规范化指纹、HTTP 状态码和响应体
             conn.execute(
@@ -774,6 +821,14 @@ def _task_dict(conn, row, with_attempts: bool = True, group_limits: dict[str, in
                 "SELECT limit_value FROM concurrency_groups WHERE name = ?", (group,)
             ).fetchone()["limit_value"]
         concurrency = {"group": group, "limit": limit_value}
+    # 持久化退避策略：未配置（或旧库迁移的历史任务）时为 null，与立即重试语义一致
+    retry_backoff = None
+    if row["backoff_initial_seconds"] is not None:
+        retry_backoff = {
+            "initial_seconds": row["backoff_initial_seconds"],
+            "multiplier": row["backoff_multiplier"],
+            "max_seconds": row["backoff_max_seconds"],
+        }
     return {
         "id": row["id"],
         "dag_id": row["dag_id"],
@@ -786,6 +841,9 @@ def _task_dict(conn, row, with_attempts: bool = True, group_limits: dict[str, in
         "failure_count": row["failure_count"],
         "max_retries": row["max_retries"],
         "duration_seconds": row["duration_seconds"],
+        "retry_backoff": retry_backoff,
+        # pending 任务的最早可领时刻：退避未到期时晚于当前时间；NULL 表示立即可领
+        "next_eligible_at": row["next_eligible_at"],
         # 剩余重试额度只与显式失败计数挂钩，与 attempt（含租约过期重领）无关
         "retries_remaining": max(0, row["max_retries"] - row["failure_count"]),
         "lease": lease,
@@ -1030,6 +1088,7 @@ def list_events(after: int, limit: int, dag_id: str | None) -> dict[str, Any]:
             "attempt": r["attempt"],
             "from_state": r["from_state"],
             "to_state": r["to_state"],
+            "next_eligible_at": r["next_eligible_at"],
             "occurred_at": r["occurred_at"],
         }
         for r in rows

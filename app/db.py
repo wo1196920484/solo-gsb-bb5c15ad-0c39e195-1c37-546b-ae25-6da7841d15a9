@@ -91,6 +91,18 @@ def init_db(path: Path | None = None) -> None:
                 -- 跨 DAG 并发组：NULL 表示不限流；非空时全库同名组内未过期
                 -- running 租约数不得超过 concurrency_groups 中持久化的上限。
                 concurrency_group   TEXT REFERENCES concurrency_groups(name),
+                -- 持久化指数退避策略（可整组为 NULL）：仅在显式失败回队时生效。
+                -- 第 failure_count 次显式失败的延迟 =
+                --   min(backoff_max_seconds,
+                --       backoff_initial_seconds * backoff_multiplier ** (failure_count - 1))
+                -- NULL 策略（及旧库迁移的历史任务）表示立即可重试。
+                backoff_initial_seconds  REAL,
+                backoff_multiplier       REAL,
+                backoff_max_seconds      REAL,
+                -- pending 任务最早可被领取的时刻：NULL 表示立即可领。
+                -- 仅显式失败回队（且配置了退避策略）会设置；领取/成功/最终失败时清空，
+                -- 租约过期重领不触发退避、也不设置该时刻。
+                next_eligible_at    TEXT,
                 UNIQUE(dag_id, task_key)
             );
 
@@ -140,6 +152,8 @@ def init_db(path: Path | None = None) -> None:
                 attempt       INTEGER,         -- 任务当前尝试序号；dag.created 时为 NULL
                 from_state    TEXT,            -- 变更前状态；dag.created 时为 NULL
                 to_state      TEXT,            -- 变更后状态；dag.created 时为 NULL
+                -- task.requeued 且配置了退避策略时携带下次可领取时刻；其余事件为 NULL
+                next_eligible_at TEXT,
                 occurred_at   TEXT NOT NULL
             );
 
@@ -181,6 +195,23 @@ def init_db(path: Path | None = None) -> None:
             conn.execute(
                 "ALTER TABLE tasks ADD COLUMN concurrency_group TEXT REFERENCES concurrency_groups(name)"
             )
+        # 旧库迁移：补齐持久化退避策略三列与下次可领时刻。历史任务均未配置退避，
+        # 默认 NULL —— 显式失败后保持立即重试，next_eligible_at 门控对其不生效。
+        if "backoff_initial_seconds" not in columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN backoff_initial_seconds REAL")
+        if "backoff_multiplier" not in columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN backoff_multiplier REAL")
+        if "backoff_max_seconds" not in columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN backoff_max_seconds REAL")
+        if "next_eligible_at" not in columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN next_eligible_at TEXT")
+
+        # 旧库迁移：事件流补 next_eligible_at 列。历史事件一律为 NULL；
+        # 仅 ADD COLUMN，不改动既有事件行，不违反不可变约束。
+        event_columns = {r[1] for r in conn.execute("PRAGMA table_info(events)").fetchall()}
+        if "next_eligible_at" not in event_columns:
+            conn.execute("ALTER TABLE events ADD COLUMN next_eligible_at TEXT")
+
         conn.execute(
             """CREATE INDEX IF NOT EXISTS idx_tasks_group_occupancy
                    ON tasks(concurrency_group)

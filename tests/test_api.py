@@ -463,6 +463,427 @@ def test_retries_remaining_tracks_only_explicit_failures(client):
     assert [a["state"] for a in status["attempts"]] == ["expired", "expired", "succeeded"]
 
 
+# ------------------------------------------------------------- 指数退避
+
+def _parse_ts(value):
+    from datetime import datetime
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _now_utc():
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc)
+
+
+def test_retry_backoff_validation(client):
+    # initial_seconds 必须为正
+    for bad in (0, -1):
+        r = client.post(
+            "/dags",
+            json={"tasks": [{"key": "a", "retry_backoff": {
+                "initial_seconds": bad, "multiplier": 2, "max_seconds": 10}}]},
+        )
+        assert r.status_code == 422
+
+    # multiplier 必须 >= 1
+    for bad in (0, 0.5, -1):
+        r = client.post(
+            "/dags",
+            json={"tasks": [{"key": "a", "retry_backoff": {
+                "initial_seconds": 1, "multiplier": bad, "max_seconds": 10}}]},
+        )
+        assert r.status_code == 422
+
+    # max_seconds 不得小于 initial_seconds
+    r = client.post(
+        "/dags",
+        json={"tasks": [{"key": "a", "retry_backoff": {
+            "initial_seconds": 10, "multiplier": 2, "max_seconds": 5}}]},
+    )
+    assert r.status_code == 422
+
+    # NaN / Infinity 一律拒绝
+    r = client.post(
+        "/dags",
+        content=json.dumps({"tasks": [{"key": "a", "retry_backoff": {
+            "initial_seconds": 1, "multiplier": "NaN", "max_seconds": 5}}]}),
+        headers={"Content-Type": "application/json"},
+    )
+    assert r.status_code == 422
+
+    # 合法策略（含 multiplier == 1 与 initial == max 的边界）
+    assert client.post(
+        "/dags",
+        json={"tasks": [{"key": "a", "retry_backoff": {
+            "initial_seconds": 1, "multiplier": 1, "max_seconds": 1}}]},
+    ).status_code == 201
+
+
+def test_backoff_huge_multiplier_caps_without_overflow(client):
+    """极大 multiplier 不导致 OverflowError：第 2 次失败起延迟恒为封顶值。"""
+    submit(client, [{
+        "key": "a", "max_retries": 3,
+        "retry_backoff": {"initial_seconds": 0.1, "multiplier": 1e308, "max_seconds": 0.5},
+    }])
+    t = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    # 第 1 次失败：指数 0 -> 延迟 0.1（= initial，尚未触顶）
+    r = client.post(
+        f"/tasks/{t['task_id']}/complete",
+        json={"completion_id": "c1", "lease_token": t["lease_token"],
+              "success": False, "error": "boom"},
+    )
+    assert r.status_code == 200
+    first_at = _parse_ts(r.json()["next_eligible_at"])
+    assert abs((first_at - _now_utc()).total_seconds() - 0.1) < 0.3
+    time.sleep(max(0.0, (first_at - _now_utc()).total_seconds()) + 0.05)
+
+    # 第 2 次失败：0.1 * 1e308 超出浮点上限 -> 安全封顶 0.5，不报 500
+    t = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    r = client.post(
+        f"/tasks/{t['task_id']}/complete",
+        json={"completion_id": "c2", "lease_token": t["lease_token"],
+              "success": False, "error": "boom"},
+    )
+    assert r.status_code == 200
+    assert r.json()["state"] == "pending"
+    next_at = _parse_ts(r.json()["next_eligible_at"])
+    assert abs((next_at - _now_utc()).total_seconds() - 0.5) < 0.3
+    # 未到期不可领
+    assert client.post("/tasks/claim", json={}).json()["count"] == 0
+
+
+def test_no_backoff_means_immediate_retry(client):
+    """未配置 retry_backoff 时行为完全不变：失败回队立即可领，时刻字段为 null。"""
+    submit(client, [{"key": "a", "max_retries": 2}])
+    t = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    r = client.post(
+        f"/tasks/{t['task_id']}/complete",
+        json={"completion_id": "c1", "lease_token": t["lease_token"],
+              "success": False, "error": "boom"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["state"] == "pending"
+    assert body["next_eligible_at"] is None
+
+    # 立即可重新领取
+    requeued_evt = client.get("/events").json()["events"][-1]
+    assert requeued_evt["type"] == "task.requeued"
+    assert requeued_evt["next_eligible_at"] is None
+    again = client.post("/tasks/claim", json={}).json()["claimed"]
+    assert len(again) == 1 and again[0]["task_id"] == t["task_id"]
+
+    detail = client.get(f"/tasks/{t['task_id']}").json()
+    assert detail["retry_backoff"] is None
+    assert detail["next_eligible_at"] is None
+
+
+def test_backoff_delay_computation_and_cap(client):
+    """延迟按 min(max, initial * multiplier^(failure_count-1)) 递增并封顶。"""
+    submit(client, [{
+        "key": "a", "max_retries": 4,
+        "retry_backoff": {"initial_seconds": 0.1, "multiplier": 2, "max_seconds": 0.5},
+    }])
+    t = client.post("/tasks/claim", json={}).json()["claimed"][0]
+
+    # failure_count 1..4 回队：0.1, 0.2, 0.4, 0.8->封顶 0.5；第 5 次显式失败耗尽 -> failed
+    expected_delays = {1: 0.1, 2: 0.2, 3: 0.4, 4: 0.5}
+    for failure_count, expected in expected_delays.items():
+        r = client.post(
+            f"/tasks/{t['task_id']}/complete",
+            json={"completion_id": f"c{failure_count}", "lease_token": t["lease_token"],
+                  "success": False, "error": "boom"},
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["state"] == "pending"
+        next_at = _parse_ts(body["next_eligible_at"])
+        occurred = _parse_ts(client.get("/events").json()["events"][-1]["occurred_at"])
+        assert abs((next_at - occurred).total_seconds() - expected) < 0.5
+        # 退避窗口过后才能领取下一次尝试
+        time.sleep(max(0.0, (next_at - _now_utc()).total_seconds()) + 0.05)
+        t = client.post("/tasks/claim", json={}).json()["claimed"][0]
+
+    # 第 5 次显式失败：max_retries=4 已耗尽
+    r = client.post(
+        f"/tasks/{t['task_id']}/complete",
+        json={"completion_id": "c5", "lease_token": t["lease_token"],
+              "success": False, "error": "boom"},
+    )
+    assert r.json()["state"] == "failed"
+    assert r.json()["next_eligible_at"] is None
+    assert client.post("/tasks/claim", json={}).json()["count"] == 0
+
+
+def test_backoff_blocks_claim_until_eligible(client):
+    """退避未到期的 pending 任务不可被领取；时刻已到立即可领，且不看 attempt。"""
+    submit(client, [{
+        "key": "a", "max_retries": 3,
+        "retry_backoff": {"initial_seconds": 0.6, "multiplier": 2, "max_seconds": 10},
+    }])
+    t = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    r = client.post(
+        f"/tasks/{t['task_id']}/complete",
+        json={"completion_id": "c1", "lease_token": t["lease_token"],
+              "success": False, "error": "boom"},
+    )
+    assert r.json()["state"] == "pending"
+    next_at = _parse_ts(r.json()["next_eligible_at"])
+
+    # 未到期：任何领取都拿不到
+    assert client.post("/tasks/claim", json={"limit": 10}).json()["count"] == 0
+    detail = client.get(f"/tasks/{t['task_id']}").json()
+    assert detail["state"] == "pending"
+    assert detail["next_eligible_at"] == r.json()["next_eligible_at"]
+
+    # 等待退避窗口过去
+    time.sleep(max(0.0, (next_at - _now_utc()).total_seconds()) + 0.2)
+    again = client.post("/tasks/claim", json={}).json()["claimed"]
+    assert len(again) == 1 and again[0]["task_id"] == t["task_id"]
+    assert again[0]["attempt"] == 2
+
+    # 领取后 next_eligible_at 已清空
+    detail = client.get(f"/tasks/{t['task_id']}").json()
+    assert detail["state"] == "running"
+    assert detail["next_eligible_at"] is None
+
+
+def test_lease_expiry_reclaim_does_not_trigger_backoff(client):
+    """租约过期重领不触发退避：不设置 next_eligible_at，立即可被重领。"""
+    submit(client, [{
+        "key": "a", "max_retries": 2, "lease_seconds": 0.2,
+        "retry_backoff": {"initial_seconds": 60, "multiplier": 2, "max_seconds": 300},
+    }])
+    t1 = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    time.sleep(0.25)
+
+    # 过期重领：退避策略存在也不生效，直接拿到
+    t2 = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    assert t2["task_id"] == t1["task_id"] and t2["attempt"] == 2
+    detail = client.get(f"/tasks/{t1['task_id']}").json()
+    assert detail["state"] == "running" and detail["next_eligible_at"] is None
+
+    # 过期重领的 claimed 事件不携带 next_eligible_at
+    evts = client.get("/events").json()["events"]
+    claimed = evts[-1]
+    assert claimed["type"] == "task.claimed"
+    assert claimed["next_eligible_at"] is None
+
+
+def test_requeued_event_carries_next_eligible_at(client):
+    submit(client, [{
+        "key": "a", "max_retries": 1,
+        "retry_backoff": {"initial_seconds": 3, "multiplier": 2, "max_seconds": 10},
+    }])
+    t = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    r = client.post(
+        f"/tasks/{t['task_id']}/complete",
+        json={"completion_id": "c1", "lease_token": t["lease_token"],
+              "success": False, "error": "boom"},
+    )
+    assert r.status_code == 200
+    next_at = r.json()["next_eligible_at"]
+    assert next_at is not None
+
+    evts = client.get("/events").json()["events"]
+    requeued = evts[-1]
+    assert requeued["type"] == "task.requeued"
+    assert requeued["next_eligible_at"] == next_at
+
+    # 其他类型事件该字段为 null
+    claimed = [e for e in evts if e["type"] == "task.claimed"]
+    assert claimed and all(e["next_eligible_at"] is None for e in claimed)
+
+
+def test_backoff_policy_returned_in_task_views(client):
+    policy = {"initial_seconds": 2.5, "multiplier": 3, "max_seconds": 20}
+    dag = submit(client, [
+        {"key": "a", "max_retries": 2, "retry_backoff": policy},
+        {"key": "b", "deps": ["a"]},
+    ])
+    assert by_key(dag, "a")["retry_backoff"] == policy
+    assert by_key(dag, "b")["retry_backoff"] is None
+    assert by_key(dag, "a")["next_eligible_at"] is None
+
+    listed = client.get("/tasks", params={"dag_id": dag["id"]}).json()["tasks"]
+    assert next(t for t in listed if t["key"] == "a")["retry_backoff"] == policy
+
+    t = client.post("/tasks/claim", json={"dag_id": dag["id"]}).json()["claimed"][0]
+    detail = client.get(f"/tasks/{t['task_id']}").json()
+    assert detail["retry_backoff"] == policy
+
+    # 失败回队后查询带下次可领时间
+    client.post(
+        f"/tasks/{t['task_id']}/complete",
+        json={"completion_id": "c1", "lease_token": t["lease_token"],
+              "success": False, "error": "boom"},
+    )
+    detail = client.get(f"/tasks/{t['task_id']}").json()
+    assert detail["state"] == "pending"
+    assert detail["next_eligible_at"] is not None
+    assert detail["retry_backoff"] == policy  # 策略持久保留
+
+
+def test_backoff_with_zero_extra_retries_never_delays(client):
+    """max_retries=0：唯一一次显式失败即终态，不产生退避延迟。"""
+    submit(client, [{
+        "key": "a", "max_retries": 0,
+        "retry_backoff": {"initial_seconds": 10, "multiplier": 2, "max_seconds": 60},
+    }, {"key": "b", "deps": ["a"]}])
+    t = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    r = client.post(
+        f"/tasks/{t['task_id']}/complete",
+        json={"completion_id": "c1", "lease_token": t["lease_token"],
+              "success": False, "error": "fatal"},
+    )
+    assert r.json()["state"] == "failed"
+    assert r.json()["next_eligible_at"] is None
+    assert client.post("/tasks/claim", json={"limit": 10}).json()["count"] == 0
+
+
+def test_backoff_replayed_response_is_byte_identical(client):
+    """含 next_eligible_at 的首次响应在幂等重放时逐字节回放。"""
+    submit(client, [{
+        "key": "a", "max_retries": 2,
+        "retry_backoff": {"initial_seconds": 0.2, "multiplier": 2, "max_seconds": 1},
+    }])
+    t1 = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    payload = {"completion_id": "c1", "lease_token": t1["lease_token"],
+               "success": False, "error": "boom"}
+    r1 = client.post(f"/tasks/{t1['task_id']}/complete", json=payload)
+    assert r1.status_code == 200
+    assert r1.json()["next_eligible_at"] is not None
+
+    # 退避窗口过后被重新领取：新尝试、新令牌
+    time.sleep(0.3)
+    t2 = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    assert t2["attempt"] == 2
+
+    r2 = client.post(f"/tasks/{t1['task_id']}/complete", json=payload)
+    assert r2.status_code == 200 and r2.text == r1.text
+    assert r2.json()["next_eligible_at"] == r1.json()["next_eligible_at"]
+
+
+def test_backoff_gate_respects_dag_filter(client):
+    """退避门控在按 dag_id 过滤领取时同样生效。"""
+    submit(client, [{
+        "key": "a", "max_retries": 1,
+        "retry_backoff": {"initial_seconds": 30, "multiplier": 2, "max_seconds": 60},
+    }], dag_id="bkf")
+    t = client.post("/tasks/claim", json={"dag_id": "bkf"}).json()["claimed"][0]
+    client.post(
+        f"/tasks/{t['task_id']}/complete",
+        json={"completion_id": "c1", "lease_token": t["lease_token"],
+              "success": False, "error": "boom"},
+    )
+    assert client.post("/tasks/claim", json={"dag_id": "bkf"}).json()["count"] == 0
+    assert client.post("/tasks/claim", json={}).json()["count"] == 0
+
+
+def test_backoff_persists_across_restart(tmp_path, monkeypatch):
+    """退避策略与下次可领时刻持久化：重启后门控仍生效，策略原样可读。"""
+    db_file = tmp_path / "backoff.db"
+    monkeypatch.setenv("DB_PATH", str(db_file))
+    monkeypatch.setenv("DEFAULT_LEASE_SECONDS", "30")
+
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    policy = {"initial_seconds": 30, "multiplier": 2, "max_seconds": 120}
+    with TestClient(app) as c1:
+        submit(c1, [{"key": "a", "max_retries": 2, "retry_backoff": policy}], dag_id="bk-restart")
+        t = c1.post("/tasks/claim", json={"dag_id": "bk-restart"}).json()["claimed"][0]
+        r = c1.post(
+            f"/tasks/{t['task_id']}/complete",
+            json={"completion_id": "c1", "lease_token": t["lease_token"],
+                  "success": False, "error": "boom"},
+        )
+        assert r.status_code == 200
+        next_at = r.json()["next_eligible_at"]
+        assert next_at is not None
+
+    with TestClient(app) as c2:
+        # 重启后仍在退避窗口内：不可领
+        assert c2.post("/tasks/claim", json={"dag_id": "bk-restart"}).json()["count"] == 0
+        detail = c2.get(f"/tasks/{t['task_id']}").json()
+        assert detail["retry_backoff"] == policy
+        assert detail["next_eligible_at"] == next_at
+        # 事件流中的下次可领时刻同样持久
+        evts = c2.get("/events", params={"dag_id": "bk-restart"}).json()["events"]
+        assert evts[-1]["type"] == "task.requeued"
+        assert evts[-1]["next_eligible_at"] == next_at
+
+
+def test_legacy_sqlite_db_gets_backoff_null(tmp_path, monkeypatch):
+    """旧版 tasks/events 表迁移后补齐退避列（NULL）：失败保持立即重试。"""
+    import sqlite3
+
+    db_file = tmp_path / "legacy-backoff.db"
+    conn = sqlite3.connect(db_file)
+    conn.executescript(
+        """
+        CREATE TABLE dags (id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL);
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY, dag_id TEXT NOT NULL, task_key TEXT NOT NULL, name TEXT NOT NULL,
+            payload TEXT, max_retries INTEGER NOT NULL DEFAULT 0, lease_seconds REAL NOT NULL,
+            state TEXT NOT NULL, blocked_reason TEXT, lease_token TEXT, lease_expires_at TEXT,
+            worker_id TEXT, attempt INTEGER NOT NULL DEFAULT 0,
+            failure_count INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT,
+            UNIQUE(dag_id, task_key));
+        CREATE TABLE dependencies (dag_id TEXT, task_key TEXT, dep_key TEXT,
+            PRIMARY KEY (dag_id, task_key, dep_key));
+        CREATE TABLE attempts (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, attempt_no INTEGER,
+            lease_token TEXT UNIQUE, worker_id TEXT, leased_at TEXT, expires_at TEXT,
+            heartbeat_at TEXT, state TEXT, error TEXT);
+        CREATE TABLE completions (
+            task_id TEXT NOT NULL, completion_id TEXT NOT NULL, lease_token TEXT NOT NULL,
+            success INTEGER NOT NULL, fingerprint TEXT NOT NULL, status_code INTEGER NOT NULL,
+            response_body TEXT NOT NULL, created_at TEXT NOT NULL,
+            PRIMARY KEY (task_id, completion_id));
+        CREATE TABLE events (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT, event_type TEXT NOT NULL,
+            dag_id TEXT NOT NULL, task_id TEXT, attempt INTEGER,
+            from_state TEXT, to_state TEXT, occurred_at TEXT NOT NULL);
+        INSERT INTO dags VALUES ('d1', 'old', '2026-01-01T00:00:00Z');
+        INSERT INTO tasks (id, dag_id, task_key, name, max_retries, lease_seconds, state,
+                           attempt, failure_count, created_at)
+        VALUES ('t1', 'd1', 'a', 'a', 1, 30, 'pending', 0, 0, '2026-01-01T00:00:00Z');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setenv("DB_PATH", str(db_file))
+    from app.db import init_db
+    from app import service
+
+    init_db()
+    init_db()  # 迁移幂等
+
+    # 历史任务无策略：查询返回 null，立即重试
+    detail = service.get_task("t1")
+    assert detail["retry_backoff"] is None
+    assert detail["next_eligible_at"] is None
+
+    t = service.claim_tasks(None, None, 1)["claimed"][0]
+    result = service.complete_task(
+        t["task_id"],
+        {"completion_id": "cmp-legacy-bk", "lease_token": t["lease_token"], "success": False},
+    )
+    assert result["state"] == "pending"
+    assert result["next_eligible_at"] is None
+
+    # 回队后立即可领（旧库迁移不引入退避）
+    again = service.claim_tasks(None, None, 1)["claimed"]
+    assert len(again) == 1 and again[0]["task_id"] == "t1"
+
+    # 事件迁移列存在：新 requeued 事件 next_eligible_at 为 null，读取不报错
+    events = service.list_events(0, 50, None)["events"]
+    requeued = [e for e in events if e["type"] == "task.requeued"]
+    assert requeued and requeued[-1]["next_eligible_at"] is None
+
+
 def test_legacy_sqlite_db_gets_failure_count_default(tmp_path, monkeypatch):
     """旧版 tasks 表（无 failure_count 列）在 init_db 时补齐默认值 0。"""
     import sqlite3
